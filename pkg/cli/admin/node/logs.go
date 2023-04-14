@@ -7,13 +7,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
@@ -54,6 +54,9 @@ var (
 
 		# Display cron log file from all masters
 		oc adm node-logs --role master --path=cron
+
+		# Display kubelet log from worker nodes using the new query sub-command
+		oc adm node-logs --role worker --query=kubelet
 	`)
 )
 
@@ -66,15 +69,21 @@ type LogsOptions struct {
 	// the log path to fetch
 	Path string
 
-	// --path=journal specific arguments
+	// Query specifies the service(s) to return the logs for
+	Query []string
+
+	// --path=journal or --query= specific arguments
 	Grep              string
 	GrepCaseSensitive bool
 	Boot              int
 	BootChanaged      bool
 	Units             []string
+	Since             string
 	SinceTime         string
+	Until             string
 	UntilTime         string
 	Tail              int
+	TailLines         int
 	Output            string
 
 	// output format arguments
@@ -112,28 +121,35 @@ func NewCmdLogs(f kcmdutil.Factory, streams genericclioptions.IOStreams) *cobra.
 		},
 	}
 
-	cmd.Flags().StringVar(&o.Path, "path", o.Path, "Retrieve the specified path within the node's /var/logs/ folder. The 'journal' value will allow querying the journal on supported operating systems.")
-
-	cmd.Flags().StringSliceVarP(&o.Units, "unit", "u", o.Units, "Return log entries from the specified unit(s). Only applies to node journal logs.")
-	cmd.Flags().StringVarP(&o.Grep, "grep", "g", o.Grep, "Filter log entries by the provided regex pattern. Only applies to node journal logs.")
+	cmd.Flags().StringVar(&o.Path, "path", o.Path, "Retrieve the specified path within the node's /var/logs/ folder. The 'journal' value will allow querying the services on supported operating systems.")
+	cmd.Flags().StringSliceVarP(&o.Query, "query", "q", o.Units, "Specifies services(s) or files from which to return logs")
+	cmd.Flags().StringSliceVarP(&o.Units, "unit", "u", o.Units, "Return log entries from the specified services(s) Only applies to node service logs.")
+	cmd.Flags().StringVarP(&o.Grep, "grep", "g", o.Grep, "Filter log entries by the provided regex pattern. Only applies to node service logs.")
 	cmd.Flags().BoolVar(&o.GrepCaseSensitive, "case-sensitive", o.GrepCaseSensitive, "Filters are case sensitive by default. Pass --case-sensitive=false to do a case insensitive filter.")
-	cmd.Flags().StringVar(&o.SinceTime, "since", o.SinceTime, "Return logs after a specific ISO timestamp or relative date. Only applies to node journal logs.")
-	cmd.Flags().StringVar(&o.UntilTime, "until", o.UntilTime, "Return logs before a specific ISO timestamp or relative date. Only applies to node journal logs.")
-	cmd.Flags().IntVar(&o.Boot, "boot", o.Boot, " Show messages from a specific boot. Use negative numbers, allowed [-100, 0], passing invalid boot offset will fail retrieving logs. Only applies to node journal logs.")
-	cmd.Flags().StringVarP(&o.Output, "output", "o", o.Output, "Display journal logs in an alternate format (short, cat, json, short-unix). Only applies to node journal logs.")
-	cmd.Flags().IntVar(&o.Tail, "tail", o.Tail, "Return up to this many lines (not more than 100k) from the end of the log. Only applies to node journal logs.")
-
+	cmd.Flags().StringVar(&o.Since, "since", o.Since, "Return logs after a specific ISO timestamp or relative date. Only applies to node service logs.")
+	cmd.Flags().StringVar(&o.SinceTime, "since-time", o.Since, "Return logs after a specific RFC3339 timestamp. Only applies to node service logs.")
+	cmd.Flags().StringVar(&o.Until, "until", o.Until, "Return logs before a specific ISO timestamp or relative date. Only applies to node service logs.")
+	cmd.Flags().StringVar(&o.UntilTime, "until-time", o.Since, "Return logs until a specific RFC3339 timestamp. Only applies to node service logs.")
+	cmd.Flags().IntVar(&o.Boot, "boot", o.Boot, " Show messages from a specific boot. Use negative numbers, allowed [-100, 0], passing invalid boot offset will fail retrieving logs. Only applies to node service logs.")
+	cmd.Flags().StringVarP(&o.Output, "output", "o", o.Output, "Display service logs in an alternate format (short, cat, json, short-unix). Only applies to node service logs.")
+	cmd.Flags().IntVar(&o.Tail, "tail", o.Tail, "Return up to this many lines (not more than 100k) from the end of the log. Only applies to node service logs.")
+	cmd.Flags().IntVar(&o.TailLines, "tail-lines", o.TailLines, "Return up to this many lines (not more than 100k) from the end of the log. Only applies to node service logs.")
 	cmd.Flags().StringVar(&o.Role, "role", o.Role, "Set a label selector by node role.")
 	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on.")
 	cmd.Flags().BoolVar(&o.Raw, "raw", o.Raw, "Perform no transformation of the returned data.")
-	cmd.Flags().BoolVar(&o.Unify, "unify", o.Unify, "Interleave logs by sorting the output. Defaults on when viewing node journal logs.")
+	cmd.Flags().BoolVar(&o.Unify, "unify", o.Unify, "Interleave logs by sorting the output. Defaults on when viewing node service logs.")
 
 	return cmd
 }
 
 func (o *LogsOptions) Complete(f kcmdutil.Factory, cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Lookup("unify").Changed {
-		o.Unify = o.Path == "journal"
+		o.Unify = o.Path == "journal" || len(o.Query) > 0
+	}
+
+	if len(o.Query) > 0 {
+		// We don't need to add the special "journal" path if in query mode
+		o.Path = ""
 	}
 
 	o.Resources = args
@@ -173,6 +189,18 @@ func (o LogsOptions) Validate() error {
 	if o.BootChanaged && (o.Boot < -100 || o.Boot > 0) {
 		return fmt.Errorf("--boot accepts values [-100, 0]")
 	}
+	if len(o.Query) > 0 && ((len(o.Path) > 0 && o.Path != "journal") || len(o.Units) > 0) {
+		return fmt.Errorf("--path and --unit flags are mutually exclusive with --query")
+	}
+	if len(o.SinceTime) > 0 && (len(o.Since) > 0 || len(o.Until) > 0) {
+		return fmt.Errorf("--since or --until flags are mutually exclusive with --since-time")
+	}
+	if len(o.UntilTime) > 0 && (len(o.Since) > 0 || len(o.Until) > 0) {
+		return fmt.Errorf("--since or --until flags are mutually exclusive with --until-time")
+	}
+	if o.Tail > 0 && o.TailLines > 0 {
+		return fmt.Errorf("cannot specify --tail and --tail-lines")
+	}
 	return nil
 }
 
@@ -192,7 +220,7 @@ type logRequest struct {
 	skipPrefix bool
 }
 
-// WriteTo prefixes the error message with the current node if necessary
+// WriteRequest prefixes the error message with the current node if necessary
 func (req *logRequest) WriteRequest(out io.Writer) error {
 	if req.err != nil {
 		return req.err
@@ -258,12 +286,16 @@ func (o LogsOptions) RunLogs() error {
 		req := client.Get().RequestURI(path).
 			SetHeader("Accept", "text/plain, */*").
 			SetHeader("Accept-Encoding", "gzip")
-		if o.Path == "journal" {
+		if o.Path == "journal" || len(o.Query) > 0 {
 			if len(o.UntilTime) > 0 {
-				req.Param("until", o.UntilTime)
+				req.Param("untilTime", o.UntilTime)
+			} else if len(o.Until) > 0 {
+				req.Param("until", o.Until)
 			}
 			if len(o.SinceTime) > 0 {
-				req.Param("since", o.SinceTime)
+				req.Param("sinceTime", o.SinceTime)
+			} else if len(o.Since) > 0 {
+				req.Param("since", o.Since)
 			}
 			if len(o.Output) > 0 {
 				req.Param("output", o.Output)
@@ -271,24 +303,38 @@ func (o LogsOptions) RunLogs() error {
 			if o.BootChanaged {
 				req.Param("boot", fmt.Sprintf("%d", o.Boot))
 			}
-			if len(o.Units) > 0 {
+			if len(o.Query) > 0 {
+				for _, unit := range o.Query {
+					req.Param("query", unit)
+				}
+			} else if len(o.Units) > 0 {
 				for _, unit := range o.Units {
+					// Needed to allow working with kubelet that does not support query
 					req.Param("unit", unit)
+					req.Param("query", unit)
 				}
 			}
 			if len(o.Grep) > 0 {
+				// Needed to allow working with kubelet that does not support query
 				req.Param("grep", o.Grep)
+				req.Param("pattern", o.Grep)
 				req.Param("case-sensitive", fmt.Sprintf("%t", o.GrepCaseSensitive))
 			}
-			if o.Tail > 0 {
+			if o.TailLines > 0 {
+				req.Param("tail", strconv.Itoa(o.TailLines))
+				req.Param("tailLines", strconv.Itoa(o.TailLines))
+			} else if o.Tail > 0 {
 				req.Param("tail", strconv.Itoa(o.Tail))
+				req.Param("tailLines", strconv.Itoa(o.Tail))
 			}
 		}
 
 		requests = append(requests, &logRequest{
 			node: info.Name,
 			req:  req,
-			raw:  o.Raw || o.Path == "journal",
+			raw: o.Raw || o.Path == "journal" ||
+				// If there is a single query item and, it begins or ends with /, is a hint that the query is for a directory in /var/log
+				(len(o.Query) == 1 && !(strings.HasPrefix(o.Query[0], string(os.PathSeparator)) || strings.HasSuffix(o.Query[0], string(os.PathSeparator)))),
 		})
 		return nil
 	})
